@@ -1,0 +1,71 @@
+# rift default configuration
+# Place at: ~/.config/rift/config.toml
+
+# ─── Keybinds ──────────────────────────────────────────────────────────
+# Format: "modifier+key" = "action [argument]"
+# Modifiers: super, alt, ctrl, shift (combine with +)
+# Keys: a-z, 0-9, f1-f12, space, tab, return, escape, left/right/up/down, etc.
+# Actions: toggle_floating, swap_next, resize_h <delta>, resize_v <delta>,
+#          close_window, exec <command>, quit
+
+[keybinds]
+"super+space"     = "toggle_floating"
+"super+tab"       = "swap_next"
+"super+left"      = "resize_h -0.05"
+"super+right"     = "resize_h 0.05"
+"super+up"        = "resize_v -0.05"
+"super+down"      = "resize_v 0.05"
+"super+return"    = "exec foot"
+"super+q"         = "close_window"
+"super+shift+q"  = "quit"
+
+# Workspace navigation
+"super+1"         = "workspace 1"
+"super+2"         = "workspace 2"
+"super+3"         = "workspace 3"
+"super+4"         = "workspace 4"
+"super+5"         = "workspace 5"
+"super+6"         = "workspace 6"
+"super+7"         = "workspace 7"
+"super+8"         = "workspace 8"
+"super+9"         = "workspace 9"
+"super+0"         = "workspace 10"
+"super+bracketleft"  = "workspace -1"
+"super+bracketright" = "workspace +1"
+
+# Move window to workspace
+"super+shift+1"   = "movetoworkspace 1"
+"super+shift+2"   = "movetoworkspace 2"
+"super+shift+3"   = "movetoworkspace 3"
+"super+shift+4"   = "movetoworkspace 4"
+"super+shift+5"   = "movetoworkspace 5"
+
+# ─── Window Rules ──────────────────────────────────────────────────────
+# Format: "regex_pattern" = "property=value,property=value"
+# Pattern matches against the window title/app_id (regex supported).
+# Properties: floating=true|false
+
+[window_rules]
+"gimp"      = "floating=true"
+".*float.*" = "floating=true"
+"pavucontrol" = "floating=true"
+
+# ─── Layout ────────────────────────────────────────────────────────────
+
+[layout]
+gaps_in  = 5
+gaps_out = 10
+border_size = 2
+
+# ─── Colors (0xRRGGBB or 0xAARRGGBB) ────────────────────────────────────
+
+[colors]
+background       = 0xFF1a1a2a
+active_border    = 0xFF7700FF
+inactive_border  = 0xFF333344
+
+# ─── Autostart (commands run on startup, in background) ─────────────────
+
+[autostart]
+0 = "waybar"
+1 = "dunst"

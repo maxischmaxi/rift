@@ -47,7 +47,7 @@ foreign wl_cursor_lib {
 
 	cursor_theme_get_cursor :: proc(theme: ^cursor_theme, name: cstring) -> ^cursor ---
 
-	cursor_image_get_buffer :: proc(image: cursor_image) -> ^buffer ---
+	cursor_image_get_buffer :: proc(image: ^cursor_image) -> ^buffer ---
 
 	cursor_frame :: proc(cursor: ^cursor, time: u32) -> int ---
 

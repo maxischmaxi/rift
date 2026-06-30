@@ -1,6 +1,6 @@
 package draw_client
 
-import wl "../wlclient"
+import wl "../../wlclient"
 import "base:runtime"
 import "core:fmt"
 import "core:sys/linux"

@@ -1,5 +1,7 @@
 #+build linux
 package wp
+import wl ".."
+
 @(private)
 viewporter_types := []^interface {
 	nil,
@@ -185,5 +187,5 @@ init_interfaces_viewporter :: proc "contextless" () {
 	viewport_interface.methods = raw_data(viewport_requests)
 }
 
-// Functions from libwayland-client
-import wl ".."
+
+

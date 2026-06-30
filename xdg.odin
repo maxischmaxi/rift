@@ -28,7 +28,9 @@ XdgToplevel :: struct {
     resource: ^wls.wl_resource,  // xdg_toplevel-Resource
     title: string,
     mapped: bool,
-    geom: Rect,                 // {x,y,w,h} im Nested-Fenster (vom Layout zugewiesen)
+    geom: Rect,                 // {x,y,w,h} im Nested-Fenster (vom Tiling-Baum zugewiesen)
+    floating: bool,             // true = frei positioniert (nicht im Tiling-Baum)
+    float_geom: Rect,           // {x,y,w,h} im Floating-Modus
 }
 
 // Leeres wl_array für configure-states (keine States = 0/0 → Client wählt Größe).
@@ -89,10 +91,12 @@ xdg_surface_destroy_resource :: proc "c" (resource: ^wls.wl_resource) {
     context = ctx
     xs := (^XdgSurface)(wls.resource_get_user_data(resource))
     if xs.toplevel != nil {
-        // toplevel.title (Odin-string) freigeben; toplevel-Struct selbst wird
-        // via xdg_toplevel_destroy_resource freigegeben, falls noch nicht geschehen.
+        // Toplevel-Lebenszyklus HIER besitzen (xdg_toplevel-Handler wird no-op).
+        if xs.toplevel.mapped do toplevel_unmap(xs.toplevel)
         if len(xs.toplevel.title) > 0 do delete(xs.toplevel.title)
+        wls.resource_set_user_data(xs.toplevel.resource, nil)  // → xdg_toplevel_destroy no-op
         free(xs.toplevel, ctx.allocator)
+        xs.toplevel = nil
     }
     if xs.surface != nil do xs.surface.xdg = nil
     free(xs, ctx.allocator)
@@ -159,6 +163,7 @@ xdg_surface_impl: wls.xdg_surface_interface = {
 xdg_toplevel_destroy_resource :: proc "c" (resource: ^wls.wl_resource) {
     context = ctx
     tl := (^XdgToplevel)(wls.resource_get_user_data(resource))
+    if tl == nil do return   // schon von xdg_surface_destroy_resource aufgeräumt
     if tl.mapped do toplevel_unmap(tl)   // aus Layout nehmen + restliche Fenster neu zeichnen
     if tl.xdg_surface != nil do tl.xdg_surface.toplevel = nil
     free(tl, ctx.allocator)
