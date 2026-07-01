@@ -87,6 +87,14 @@ XDG_WM_BASE_PING        :: u32(0)
 XDG_SURFACE_CONFIGURE   :: u32(0)
 XDG_TOPLEVEL_CONFIGURE  :: u32(0)
 XDG_TOPLEVEL_CLOSE      :: u32(1)
+XDG_POPUP_CONFIGURE     :: u32(0)
+XDG_POPUP_POPUP_DONE    :: u32(1)
+
+// ─── xdg_toplevel.state-Werte (xdg-shell.xml, ab v1 gültig) ─────────────
+XDG_TOPLEVEL_STATE_MAXIMIZED  :: u32(1)
+XDG_TOPLEVEL_STATE_FULLSCREEN :: u32(2)
+XDG_TOPLEVEL_STATE_RESIZING   :: u32(3)
+XDG_TOPLEVEL_STATE_ACTIVATED  :: u32(4)
 
 // ─── send_* Helper (post_event mit richtigem Opcode) ────────────────────
 xdg_wm_base_send_ping :: proc "c" (resource: ^wl_resource, serial: u32) {
@@ -100,4 +108,14 @@ xdg_surface_send_configure :: proc "c" (resource: ^wl_resource, serial: u32) {
 // xdg_toplevel.configure: width, height, states(wl_array). 0/0 = Client wählt.
 xdg_toplevel_send_configure :: proc "c" (resource: ^wl_resource, width, height: i32, states: ^wl_array) {
     resource_post_event(resource, XDG_TOPLEVEL_CONFIGURE, width, height, states)
+}
+
+// xdg_popup.configure: Position relativ zur Window-Geometry des Parents.
+xdg_popup_send_configure :: proc "c" (resource: ^wl_resource, x, y, width, height: i32) {
+    resource_post_event(resource, XDG_POPUP_CONFIGURE, x, y, width, height)
+}
+
+// xdg_popup.popup_done: Popup wurde dismissed (Außenklick, Parent weg).
+xdg_popup_send_popup_done :: proc "c" (resource: ^wl_resource) {
+    resource_post_event(resource, XDG_POPUP_POPUP_DONE)
 }

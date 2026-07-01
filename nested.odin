@@ -3,6 +3,7 @@ package main
 import wl "./wlclient"
 import xdg "./wlclient/xdg"
 import wpx "./wlclient/wp"
+import wls "./wayland_server"
 import "base:runtime"
 import "core:c"
 import "core:fmt"
@@ -72,7 +73,9 @@ Nested :: struct {
     kb_repeat_delay:i32,
 }
 
-nested:     Nested
+// kb_keymap_fd = -1: 0 ist ein gültiger fd (stdin!) — ohne explizite Init
+// würde im DRM-Modus (nested_init läuft nie) dup(0) als Keymap verschickt.
+nested:     Nested = { kb_keymap_fd = -1 }
 nested_ctx: runtime.Context
 
 // ─── Parent-Registry: Globals abfangen ──────────────────────────────────
@@ -129,7 +132,9 @@ nested_seat_listener: wl.seat_listener = {
 nested_kb_keymap :: proc "c" (data: rawptr, kb: ^wl.keyboard, format: wl.keyboard_keymap_format, fd: int, size: uint) {
     context = nested_ctx
     // fd duplizieren (das Original wird von libwayland-client geschlossen),
-    // damit wir es pro rift-Client weiterreichen können.
+    // damit wir es pro rift-Client weiterreichen können. Sendet der Host die
+    // Keymap erneut (Layout-Wechsel), den alten dup schließen statt leaken.
+    if nested.kb_keymap_fd >= 0 do posix.close(posix.FD(nested.kb_keymap_fd))
     nested.kb_keymap_fd = i32(posix.dup(posix.FD(fd)))
     nested.kb_keymap_size = u32(size)
     fmt.printfln("[nested] keymap empfangen (size=%d), fd dup'd", size)
@@ -286,7 +291,8 @@ nested_surface_configure :: proc "c" (data: rawptr, xsurface: ^xdg.surface, seri
         wpx.viewport_set_destination(nested.viewport, int(nested.win_w), int(nested.win_h))
     }
     // Buffer bei Größenänderung neu erzeugen (sonst Overflow in nested_clear).
-    if nested.buffer == nil || nested.buf_w != nested.win_w || nested.buf_h != nested.win_h {
+    resized := nested.buffer == nil || nested.buf_w != nested.win_w || nested.buf_h != nested.win_h
+    if resized {
         if nested.buffer != nil do nested_destroy_buffer()
         nested_create_buffer()
     }
@@ -294,8 +300,16 @@ nested_surface_configure :: proc "c" (data: rawptr, xsurface: ^xdg.surface, seri
         wl.surface_attach(nested.surface, nested.buffer, 0, 0)
         wl.surface_damage(nested.surface, 0, 0, int(nested.win_w), int(nested.win_h))
         wl.surface_commit(nested.surface)
+        first := !nested.configured
         nested.configured = true
-        fmt.println("[nested] Fenster konfiguriert + erstes Bild committet")
+        if first do fmt.println("[nested] Fenster konfiguriert + erstes Bild committet")
+        // Host-Resize: Layout an die neue Canvas anpassen, Clients umkonfigurieren
+        // und den neuen wl_output-Mode an alle melden.
+        if resized && !first && g_server != nil {
+            layout_toplevels()
+            composite_all()
+            output_broadcast_mode()
+        }
     }
 }
 nested_surface_listener: xdg.surface_listener = { configure = nested_surface_configure }
@@ -309,6 +323,9 @@ nested_create_buffer :: proc() {
     name := fmt.caprintf("/rift_nested_%v", uintptr(nested.display))
     fd := posix.shm_open(name, {.RDWR, .CREAT, .EXCL}, {.IRUSR, .IWUSR})
     if fd < 0 { fmt.println("[nested] shm_open fehlgeschlagen"); return }
+    // fd wird nur bis create_pool gebraucht (mmap + libwayland halten eigene
+    // Referenzen) — ohne close leakt jeder Host-Resize einen fd (EMFILE).
+    defer posix.close(fd)
     posix.shm_unlink(name)
     if posix.ftruncate(auto_cast fd, auto_cast size) == .FAIL {
         fmt.println("[nested] ftruncate fehlgeschlagen"); return
@@ -373,13 +390,53 @@ nested_blit_scaled :: proc(src: [^]u32, src_w, src_h: i32, dx, dy, dw, dh: i32) 
     context = nested_ctx
     if nested.pixels == nil || dw <= 0 || dh <= 0 || src_w <= 0 || src_h <= 0 do return
     ww := int(nested.buf_w)   // Stride = allozierte Breite
+    hh := int(nested.buf_h)
     if ww <= 0 do ww = int(nested.win_w)
-    for y in 0..<dh {
-        sy := y * src_h / dh
-        for x in 0..<dw {
-            sx := x * src_w / dw
-            nested.pixels[int(dy+y)*ww + int(dx+x)] = src[int(sy)*int(src_w) + int(sx)]
+    if hh <= 0 do hh = int(nested.win_h)
+    if ww <= 0 || hh <= 0 do return
+    // Ziel-Rechteck auf den Buffer clippen — Floating-Fenster können (teilweise)
+    // außerhalb liegen (negative dx/dy beim Drag, dx+dw > Buffer).
+    x0 := max(int(dx), 0)
+    y0 := max(int(dy), 0)
+    x1 := min(int(dx) + int(dw), ww)
+    y1 := min(int(dy) + int(dh), hh)
+    if x0 >= x1 || y0 >= y1 do return
+    for py in y0..<y1 {
+        sy := (py - int(dy)) * int(src_h) / int(dh)
+        drow := py * ww
+        srow := sy * int(src_w)
+        for px in x0..<x1 {
+            sx := (px - int(dx)) * int(src_w) / int(dw)
+            nested.pixels[drow + px] = src[srow + sx]
         }
+    }
+}
+
+// nested_blit_clipped: Quelle 1:1 (unskaliert) an (dst_x,dst_y) blitten,
+// beschnitten auf clip ∩ Buffer. Ersetzt die Nearest-Neighbor-Skalierung:
+// Clients rendern dank configure-Pipeline in ihrer echten Tile-Größe; während
+// der Übergangsphase (alter Buffer) wird geclippt statt verzerrt.
+nested_blit_clipped :: proc(src: [^]u32, src_w, src_h: i32, src_stride: i32, dst_x, dst_y: i32, clip: Rect) {
+    context = nested_ctx
+    if nested.pixels == nil || src_w <= 0 || src_h <= 0 do return
+    ww := int(nested.buf_w)
+    hh := int(nested.buf_h)
+    if ww <= 0 do ww = int(nested.win_w)
+    if hh <= 0 do hh = int(nested.win_h)
+    if ww <= 0 || hh <= 0 do return
+    sstride := int(src_stride) if src_stride > 0 else int(src_w)
+    // Schnitt aus Ziel-Rechteck des Buffers, Clip-Rechteck und Buffer-Grenzen.
+    x0 := max(int(dst_x), int(clip[0]), 0)
+    y0 := max(int(dst_y), int(clip[1]), 0)
+    x1 := min(int(dst_x) + int(src_w), int(clip[0] + clip[2]), ww)
+    y1 := min(int(dst_y) + int(src_h), int(clip[1] + clip[3]), hh)
+    if x0 >= x1 || y0 >= y1 do return
+    // Zeilenweises memcpy statt Pixel-Loop (siehe drm_blit_clipped).
+    row_bytes := (x1 - x0) * 4
+    for py in y0..<y1 {
+        drow := py * ww
+        srow := (py - int(dst_y)) * sstride - int(dst_x)
+        runtime.mem_copy_non_overlapping(rawptr(nested.pixels[drow + x0:]), rawptr(src[srow + x0:]), row_bytes)
     }
 }
 
@@ -390,31 +447,56 @@ nested_commit_window :: proc() {
     wl.surface_attach(nested.surface, nested.buffer, 0, 0)
     wl.surface_damage(nested.surface, 0, 0, int(nested.win_w), int(nested.win_h))
     wl.surface_commit(nested.surface)
-    wl.display_flush(nested.display)
+    nested_flush()
+}
+
+// Flush zum Host mit Fehlerbehandlung: EAGAIN = Socket voll (harmlos, wird beim
+// nächsten Flush nachgeholt), alles andere = Host-Verbindung tot → sauber beenden.
+nested_flush :: proc() {
+    context = nested_ctx
+    if wl.display_flush(nested.display) < 0 && posix.errno() != .EAGAIN {
+        fmt.println("[nested] display_flush fehlgeschlagen — Host-Verbindung verloren, rift beendet sich")
+        if g_server != nil && g_server.display != nil {
+            wls.display_terminate(g_server.display)
+        }
+    }
 }
 
 // ─── Present: empfangene Pixel ins Hyprland-Fenster blitten ─────────────
 nested_present :: proc(src: [^]u32, w, h: i32) {
     context = nested_ctx
-    if !nested.configured || nested.buffer == nil do return
-    cw := w if w < NESTED_W else NESTED_W
-    ch := h if h < NESTED_H else NESTED_H
+    if !nested.configured || nested.buffer == nil || nested.pixels == nil do return
+    // Stride/Grenzen = tatsächliche Buffer-Größe, NICHT die NESTED_*-Konstanten —
+    // nach einem Host-Resize wäre sonst der Stride falsch bzw. der Blit out-of-bounds.
+    bw := nested.buf_w if nested.buf_w > 0 else nested.win_w
+    bh := nested.buf_h if nested.buf_h > 0 else nested.win_h
+    if bw <= 0 || bh <= 0 || w <= 0 do return
+    cw := min(w, bw)
+    ch := min(h, bh)
     for y in 0..<ch {
         for x in 0..<cw {
-            nested.pixels[y*NESTED_W + x] = src[y*w + x]
+            nested.pixels[int(y)*int(bw) + int(x)] = src[int(y)*int(w) + int(x)]
         }
     }
     wl.surface_attach(nested.surface, nested.buffer, 0, 0)
     wl.surface_damage(nested.surface, 0, 0, auto_cast cw, auto_cast ch)
     wl.surface_commit(nested.surface)
-    wl.display_flush(nested.display)
+    nested_flush()
 }
 
 // ─── fd-Callback: Parent-Client in den Server-Loop einklinken ──────────
 nested_dispatch :: proc "c" (fd: c.int, mask: u32, data: rawptr) -> c.int {
     context = nested_ctx
-    // fd ist lesbar → Hyprland hat Events. Lesen + dispatchen.
-    wl.display_dispatch(nested.display)
+    // Host weg (HANGUP/ERROR) oder dispatch-Fehler: ohne Terminate bliebe der
+    // fd permanent "lesbar" → Endlos-Wiedereintritt mit 100 % CPU.
+    if mask & (wls.WL_EVENT_HANGUP | wls.WL_EVENT_ERROR) != 0 ||
+       wl.display_dispatch(nested.display) < 0 {
+        fmt.println("[nested] Host-Verbindung verloren — rift beendet sich")
+        if g_server != nil && g_server.display != nil {
+            wls.display_terminate(g_server.display)
+        }
+        return 0
+    }
     return 0
 }
 

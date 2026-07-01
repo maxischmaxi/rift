@@ -119,7 +119,9 @@ workspace_move_window :: proc(tl: ^XdgToplevel, target_id: int, follow: bool) {
     fmt.printfln("[ws] move %q → Workspace {}", tl.title, target_id)
     // Fokus aufräumen wenn das verschobene Fenster fokussiert war
     if g_server.focused == tl do g_server.focused = nil
-    if g_server.ptr_focus == tl do g_server.ptr_focus = nil
+    if tl.xdg_surface != nil && g_server.ptr_focus == tl.xdg_surface.surface {
+        g_server.ptr_focus = nil
+    }
     if g_server.wm_tl == tl { g_server.wm_tl = nil; g_server.wm_mode = .None; g_server.wm_split = nil }
     if follow {
         workspace_switch(target_id)

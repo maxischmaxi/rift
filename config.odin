@@ -47,6 +47,12 @@ Config :: struct {
     active_border:  u32,
     inactive_border: u32,
     autostart:      [dynamic]string,
+    refresh_rate:   u32,   // Wunsch-Hz im DRM-Modus; 0 = höchste Rate des Monitors
+    // XKB-Keymap für den DRM-Modus (leer = System-Default/XKB_DEFAULT_*)
+    kb_layout:      string,
+    kb_variant:     string,
+    kb_options:     string,
+    kb_model:       string,
     loaded:          bool,
 }
 
@@ -128,6 +134,7 @@ config_default :: proc() {
     g_config.bg_color      = 0xFF1a1a2a
     g_config.active_border   = 0xFF7700FF
     g_config.inactive_border = 0xFF333344
+    g_config.refresh_rate    = 0  // 0 = so viel Hz wie der Monitor hergibt
 
     default_binds := []string{ "super+space", "super+tab",
         "super+left", "super+right", "super+up", "super+down" }
@@ -217,6 +224,10 @@ config_parse :: proc(data: string) {
             append(&g_config.window_rules, wr)
         case "layout":
             parse_layout(key, val)
+        case "monitor":
+            parse_monitor(key, val)
+        case "input":
+            parse_input(key, val)
         case "colors":
             parse_color(key, val)
         case "autostart":
@@ -331,6 +342,25 @@ parse_layout :: proc(key, val: string) {
     case "gaps_out":    g_config.gaps_out   = i32(parse_hex_or_int(val))
     case "border_size": g_config.border_size = i32(parse_hex_or_int(val))
     case: fmt.printfln("[config] unbekanntes Layout-Setting: %q", key)
+    }
+}
+
+parse_monitor :: proc(key, val: string) {
+    switch key {
+    case "refresh_rate": g_config.refresh_rate = u32(parse_hex_or_int(val))
+    case: fmt.printfln("[config] unbekanntes Monitor-Setting: %q", key)
+    }
+}
+
+parse_input :: proc(key, val: string) {
+    context = ctx
+    v := strings.clone(unquote(val))
+    switch key {
+    case "kb_layout":  g_config.kb_layout  = v
+    case "kb_variant": g_config.kb_variant = v
+    case "kb_options": g_config.kb_options = v
+    case "kb_model":   g_config.kb_model   = v
+    case: fmt.printfln("[config] unbekanntes Input-Setting: %q", key)
     }
 }
 

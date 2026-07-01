@@ -141,6 +141,13 @@ tree_remove :: proc(tl: ^XdgToplevel) {
         if gp.a == p { gp.a = sibling } else { gp.b = sibling }
         sibling.parent = gp
     }
+    // Läuft gerade ein Resize-Drag auf diesem Split (Geschwister des
+    // schließenden Fensters), würde wm_split nach dem free danglen.
+    if g_server.wm_split == p {
+        g_server.wm_split = nil
+        g_server.wm_tl = nil
+        g_server.wm_mode = .None
+    }
     free(leaf, ctx.allocator)
     free(p, ctx.allocator)
 }

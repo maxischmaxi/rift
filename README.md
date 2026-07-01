@@ -86,7 +86,43 @@ pacman -S odin wayland wayland-protocols
 make            # build the compositor
 make test       # build rift + test clients
 make run        # build + run
+make install    # install rift system-wide (or --user)
+make uninstall  # remove rift
 ```
+
+## Installation
+
+### Systemweit (empfohlen für SDDM)
+
+```bash
+sudo make install
+# oder mit Prefix:
+sudo ./scripts/install.sh --prefix=/usr
+```
+
+### Nur für aktuellen User (kein sudo)
+
+```bash
+./scripts/install.sh --user
+```
+
+### Entfernen
+
+```bash
+sudo make uninstall                          # Systemweite Installation
+./scripts/uninstall.sh --user                # User-Installation
+sudo ./scripts/uninstall.sh --purge          # + User-Config löschen
+```
+
+### Was installiert wird
+
+| Datei | Pfad | Zweck |
+|---|---|---|
+| `rift` | `$PREFIX/bin/rift` | Compositor-Binary |
+| `rift-session` | `$PREFIX/bin/rift-session` | Session-Wrapper für SDDM |
+| `rift.desktop` | `$PREFIX/share/wayland-sessions/rift.desktop` | SDDM-Session-Eintrag |
+| `config.toml.example` | `$PREFIX/share/rift/config.toml.example` | Config-Vorlage |
+| `config.toml` | `~/.config/rift/config.toml` | User-Config (wenn nicht vorhanden) |
 
 ## Running
 
@@ -106,6 +142,24 @@ WAYLAND_DISPLAY=rift-0 alacritty
 Any Wayland app that supports `WAYLAND_DISPLAY` can connect to rift.
 rift tiles them automatically.
 
+### Als SDDM-Session (Display Manager)
+
+rift appearsin SDDM as a session option after `make install`. Since rift
+currently runs nested, the `rift-session` wrapper starts a minimal host
+compositor (`cage` or `sway`) as the DRM backend, with rift running fullscreen
+inside it.
+
+**Prerequisites:**
+
+```bash
+sudo pacman -S cage     # minimal kiosk compositor (empfohlen, ~50KB)
+# oder:
+sudo pacman -S sway     # alternative Host
+```
+
+Nach der Installation: Abmelden → SDDM zeigt "rift" als Session → Anmelden.
+rift läuft dann via `cage rift` als Vollbild-Compositor.
+
 ### Safety in nested mode
 
 - rift is **only a client** of your host compositor — no DRM, no input
@@ -119,11 +173,17 @@ rift tiles them automatically.
 | Binding | Action |
 |---|---|
 | `Super` + `Space` | Toggle floating (tiled ↔ floating) |
+| `Super` + `1`–`9` | Switch to workspace N |
+| `Super` + `Shift` + `1`–`9` | Move window to workspace N |
+| `Super` + `[` / `]` | Previous / next workspace |
 | `Super` + left-drag | Move window (swap if tiled, drag if floating) |
 | `Super` + right-drag | Resize window (split ratio if tiled, free if floating) |
 | `Super` + `Tab` | Swap focused window with next |
 | `Super` + `←` / `→` | Resize split horizontally |
 | `Super` + `↑` / `↓` | Resize split vertically |
+| `Super` + `Return` | Launch terminal (`exec foot`) |
+| `Super` + `Q` | Close window |
+| `Super` + `Shift` + `Q` | Quit rift |
 | Click | Focus window |
 
 > **Nested-mode note:** Hyprland grabs `Super`+mouse by default
@@ -178,8 +238,16 @@ rift/
 ├── input.odin             Input forwarding: keyboard, pointer, focus,
 │                          WM interactions (move/resize)
 ├── layout.odin            Split-tree tiling: add/remove/swap/resize
+├── workspace.odin         Workspaces: switch, move window, multi-monitor-ready
+├── config.odin            TOML config: keybinds, window rules, colors, autostart
 ├── nested.odin            Nested backend: rift as Hyprland client,
 │                          buffer management, cursor, input bridge
+├── scripts/
+│   ├── install.sh         Install binary, session entry, config
+│   └── uninstall.sh       Remove all rift files
+├── assets/
+│   ├── rift.desktop       SDDM/wayland-sessions entry
+│   └── rift-session       Session wrapper (cage/sway host for standalone)
 ├── wayland_server/        libwayland-server bindings (hand-ported)
 │   ├── libwayland.odin    C function bindings
 │   ├── protocol.odin      Core Wayland protocol (generated vtables)
@@ -215,12 +283,16 @@ the compositor blits each client's SHM buffer into its tile.
 
 ## Roadmap
 
-- [ ] Standalone backend (DRM/KMS) — run without a host compositor
+- [x] Installation (`make install` / `make uninstall`, SDDM-Session via cage-Wrapper)
 - [x] Configuration file (TOML: keybinds, window rules, colors, autostart)
 - [x] Floating windows (toggle with Super+Space, drag to move/resize)
 - [x] Workspaces (10 workspaces, switch with Super+1-9, move with Super+Shift+1-9)
+- [ ] Standalone backend (DRM/KMS) — run without a host compositor
 - [ ] GPU rendering (EGL + dmabuf)
 - [ ] wlr-protocols (layer-shell, output-management, etc.)
+- [ ] Session lock (ext-session-lock-v1)
+- [ ] Clipboard / DnD (wl_data_device)
+- [ ] Damage tracking / vsync presentation
 
 ## License
 

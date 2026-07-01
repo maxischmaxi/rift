@@ -22,9 +22,11 @@ WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 :: u32(1)
 
 // Wird aufgerufen, wenn ein rift-Client wl_seat.get_keyboard schickt.
 // (Erweitert den bestehenden Handler in server.odin.)
-input_seat_get_keyboard :: proc(client: ^wls.wl_client, id: u32) -> ^wls.wl_resource {
+input_seat_get_keyboard :: proc(client: ^wls.wl_client, id: u32, version: c.int) -> ^wls.wl_resource {
     context = ctx
-    kb := wls.resource_create(client, &wls.keyboard_interface, 4, id)
+    // Version der Seat-Resource erben — ein v2-Client darf KEINE v4-Events
+    // (repeat_info) bekommen, sonst crasht sein libwayland (NULL-Listener-Slot).
+    kb := wls.resource_create(client, &wls.keyboard_interface, version, id)
     if kb == nil {
         wls.client_post_no_memory(client)
         return nil
@@ -32,15 +34,20 @@ input_seat_get_keyboard :: proc(client: ^wls.wl_client, id: u32) -> ^wls.wl_reso
     wls.resource_set_implementation(kb, &keyboard_impl, kb, keyboard_resource_destroy)
 
     // Keymap vom Hyprland-Parent weiterreichen (frisch dup'd fd pro Client).
-    if nested.kb_keymap_fd >= 0 {
+    // size-Guard: ohne empfangene Keymap (DRM-Modus, Race beim Start) darf
+    // kein fd mit size=0 verschickt werden — Clients mmap'en das und scheitern.
+    if nested.kb_keymap_fd >= 0 && nested.kb_keymap_size > 0 {
         fd := posix.dup(posix.FD(nested.kb_keymap_fd))
         if fd >= 0 {
             wls.resource_post_event(kb, wls.WL_KEYBOARD_KEYMAP,
                 WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, c.int(fd), nested.kb_keymap_size)
+            // libwayland dupliziert den fd beim Marshalling — unser dup muss
+            // wieder zu, sonst leakt ein fd pro wl_keyboard-Bind.
+            posix.close(fd)
         }
     }
-    // Repeat-Info weiterreichen (falls vorhanden).
-    if nested.kb_repeat_rate > 0 {
+    // Repeat-Info weiterreichen (Event existiert erst ab wl_seat v4).
+    if version >= 4 && nested.kb_repeat_rate > 0 {
         wls.resource_post_event(kb, wls.WL_KEYBOARD_REPEAT_INFO,
             c.int(nested.kb_repeat_rate), c.int(nested.kb_repeat_delay))
     }
@@ -82,16 +89,29 @@ focused_surface_resource :: proc() -> ^wls.wl_resource {
 
 // ─── Vom Nested-Backend aufgerufene Forward-Funktionen ──────────────────
 
+// Aktuellen Modifier-Stand an eine Keyboard-Resource schicken (Pflicht nach
+// jedem enter — sonst verpasst der Client gehaltene Shift/Ctrl beim Fokuswechsel).
+send_modifiers_to :: proc(kb: ^wls.wl_resource) {
+    if kb == nil do return
+    serial := wls.display_next_serial(g_server.display)
+    wls.resource_post_event(kb, wls.WL_KEYBOARD_MODIFIERS, serial,
+        g_server.mods_depressed, g_server.mods_latched, g_server.mods_locked, g_server.mods_group)
+}
+
 // rift-Fenster hat in Hyprland Fokus bekommen (enter) oder verloren (leave).
-input_keyboard_focus :: proc(gained: bool, serial: u32) {
+// Host-Serials werden NICHT weitergereicht — rift-Clients bekommen Serials aus
+// rifts eigenem Nummernraum (sonst scheitern set_cursor/grab-Validierungen).
+input_keyboard_focus :: proc(gained: bool, host_serial: u32) {
     context = ctx
     kb := focused_keyboard()
     if kb == nil do return
     surf := focused_surface_resource()
     if surf == nil do return
+    serial := wls.display_next_serial(g_server.display)
     if gained {
         empty: wls.wl_array = {}   // keine aktuell gedrückten Keys
         wls.resource_post_event(kb, wls.WL_KEYBOARD_ENTER, serial, surf, &empty)
+        send_modifiers_to(kb)
         fmt.println("[input] keyboard enter → fokussiertes rift-Fenster")
     } else {
         wls.resource_post_event(kb, wls.WL_KEYBOARD_LEAVE, serial, surf)
@@ -106,25 +126,64 @@ input_keyboard_focus :: proc(gained: bool, serial: u32) {
 //   Alt_L/R    evdev  56/100 → wl  64/108   (Mod1 = 0x08)
 input_keyboard_key :: proc(time: u32, key: u32, state: u32) {
     context = ctx
+    // `key` ist der EVDEV-Keycode (Wayland-Wire-Format — beide Backends).
+    // Intern (Keybind-Tabelle, Modifier-Tracking) rechnen wir in X11/XKB-
+    // Codes: xkb = evdev + 8. An Clients geht IMMER der evdev-Code raus.
+    xkb_key := key + 8
+    // Modifier-Tracking — XKB-Keycodes:
+    // Shift_L/R:  evdev  42/54  → xkb  50/62   (Mod Shift = 0x01)
+    // Ctrl_L/R:   evdev  29/97  → xkb  37/105  (Mod Ctrl  = 0x04)
+    // Alt_L/R:    evdev  56/100 → xkb  64/108  (Mod Alt    = 0x08)
+    // Super_L/R:  evdev 125/126 → xkb 133/134 (Mod Super  = 0x40)
+    old_mods := g_server.mods_depressed
     if state == 1 {
-        if key == 133 || key == 134 { g_server.mods_depressed |= WM_MOD_SUPER }
-        if key ==  64 || key == 108 { g_server.mods_depressed |= WM_MOD_ALT   }
+        if xkb_key == 133 || xkb_key == 134 { g_server.mods_depressed |= WM_MOD_SUPER }
+        if xkb_key ==  64 || xkb_key == 108 { g_server.mods_depressed |= WM_MOD_ALT   }
+        if xkb_key ==  50 || xkb_key ==  62 { g_server.mods_depressed |= WM_MOD_SHIFT }
+        if xkb_key ==  37 || xkb_key == 105 { g_server.mods_depressed |= WM_MOD_CTRL  }
     } else {
-        if key == 133 || key == 134 { g_server.mods_depressed &~= WM_MOD_SUPER }
-        if key ==  64 || key == 108 { g_server.mods_depressed &~= WM_MOD_ALT   }
+        if xkb_key == 133 || xkb_key == 134 { g_server.mods_depressed &~= WM_MOD_SUPER }
+        if xkb_key ==  64 || xkb_key == 108 { g_server.mods_depressed &~= WM_MOD_ALT   }
+        if xkb_key ==  50 || xkb_key ==  62 { g_server.mods_depressed &~= WM_MOD_SHIFT }
+        if xkb_key ==  37 || xkb_key == 105 { g_server.mods_depressed &~= WM_MOD_CTRL  }
+    }
+    // Im DRM-Modus liefert kein Parent modifiers-Events → bei Änderung
+    // selbst an den Client schicken (die WM_MOD-Masken entsprechen den
+    // XKB-Modifier-Masken der Standard-Keymaps: Shift=1, Ctrl=4, Alt=8, Super=64).
+    if g_backend_drm && g_server.mods_depressed != old_mods {
+        input_keyboard_modifiers(g_server.mods_depressed, 0, 0, 0)
     }
     wm_held := (g_server.mods_depressed & (WM_MOD_SUPER | WM_MOD_ALT)) != 0
     // ── WM-Tastaturkürzel (Super/Alt + Taste): intercepten, nicht weiterleiten ──
     if wm_held && state == 1 {
-        focused := g_server.focused
-        if focused != nil {
-            // Config-basierte Keybind-Suche
-            idx := config_find_keybind(g_server.mods_depressed, key)
-            if idx >= 0 {
-                kb := g_config.keybinds[idx]
-                dispatch_action(kb.action, kb.arg, focused)
+        // Config-basierte Keybind-Suche — funktioniert AUCH ohne fokussiertes Fenster
+        // (z.B. Super+Shift+Q zum Beenden wenn kein Client verbunden ist)
+        idx := config_find_keybind(g_server.mods_depressed, xkb_key)
+        if idx >= 0 {
+            kb := g_config.keybinds[idx]
+            focused := g_server.focused  // kann nil sein — dispatch_action muss das handhaben
+            append(&g_server.suppressed_keys, key)  // Release ebenfalls schlucken
+            dispatch_action(kb.action, kb.arg, focused)
+            return
+        }
+    }
+    // Release einer abgefangenen Keybind-Taste: nicht an den Client leiten —
+    // der sähe sonst einen unbalancierten Release ohne vorangegangenen Press.
+    if state == 0 {
+        for sk, i in g_server.suppressed_keys {
+            if sk == key {
+                unordered_remove(&g_server.suppressed_keys, i)
                 return
             }
+        }
+    }
+    // Layer-Surface mit Tastaturfokus (z.B. rofi) hat Vorrang vor dem Fenster
+    if g_layer_kb_focus != nil {
+        lkb := layer_keyboard(g_layer_kb_focus)
+        if lkb != nil {
+            serial := wls.display_next_serial(g_server.display)
+            wls.resource_post_event(lkb, wls.WL_KEYBOARD_KEY, serial, time, key, state)
+            return
         }
     }
     kb := focused_keyboard()
@@ -138,8 +197,9 @@ dispatch_action :: proc(action: Action, arg: string, focused: ^XdgToplevel) {
     context = ctx
     #partial switch action {
     case .ToggleFloating:
-        toggle_floating(focused)
+        if focused != nil do toggle_floating(focused)
     case .SwapNext:
+        if focused == nil do return
         idx := -1
         for t, i in g_server.active_ws.toplevels {
             if t == focused { idx = i; break }
@@ -156,13 +216,15 @@ dispatch_action :: proc(action: Action, arg: string, focused: ^XdgToplevel) {
             }
         }
     case .ResizeH:
+        if focused == nil do return
         dh := f64(parse_hex_or_int(arg))
         wm_resize_focused(focused, dh, 0.0)
     case .ResizeV:
+        if focused == nil do return
         dv := f64(parse_hex_or_int(arg))
         wm_resize_focused(focused, 0.0, dv)
     case .CloseWindow:
-        if focused.resource != nil {
+        if focused != nil && focused.resource != nil {
             wls.resource_post_event(focused.resource, wls.XDG_TOPLEVEL_CLOSE)
             fmt.printfln("[wm] close %q", focused.title)
         }
@@ -180,6 +242,7 @@ dispatch_action :: proc(action: Action, arg: string, focused: ^XdgToplevel) {
             workspace_switch(ws_id)
         }
     case .MoveToWorkspace:
+        if focused == nil do return
         ws_id := int(parse_hex_or_int(arg))
         workspace_move_window(focused, ws_id, follow=true)
     case .Quit:
@@ -199,10 +262,12 @@ wm_resize_focused :: proc(tl: ^XdgToplevel, dh, dv: f64) {
     context = ctx
     if tl.floating {
         // Floating: Größe um 5% der Canvas anpassen
-        cw := f64(nested.win_w); if cw <= 0 do cw = NESTED_W
-        ch := f64(nested.win_h); if ch <= 0 do ch = NESTED_H
+        cwi, chi := canvas_size()   // DRM- und Nested-korrekt
+        cw := f64(cwi)
+        ch := f64(chi)
         tl.float_geom[2] = i32(clamp(f64(tl.float_geom[2]) + dh*cw*0.1, 50, cw))
         tl.float_geom[3] = i32(clamp(f64(tl.float_geom[3]) + dv*ch*0.1, 50, ch))
+        toplevel_send_configure(tl)
         composite_all()
         fmt.printfln("[wm] KEY float resize %q → %dx%d", tl.title, tl.float_geom[2], tl.float_geom[3])
         return
@@ -225,7 +290,11 @@ WM_MOD_ALT   :: u32(0x08)   // Mod1 (Alt) — Test-Fallback im Nested-Modus
 input_keyboard_modifiers :: proc(depressed, latched, locked, group: u32) {
     context = ctx
     g_server.mods_depressed = depressed
-    kb := focused_keyboard()
+    g_server.mods_latched = latched
+    g_server.mods_locked = locked
+    g_server.mods_group = group
+    // Layer-Surface mit Tastaturfokus bekommt die Modifiers (statt Fenster)
+    kb := g_layer_kb_focus != nil ? layer_keyboard(g_layer_kb_focus) : focused_keyboard()
     if kb == nil do return
     serial := wls.display_next_serial(g_server.display)
     wls.resource_post_event(kb, wls.WL_KEYBOARD_MODIFIERS, serial, depressed, latched, locked, group)
@@ -238,6 +307,10 @@ input_focus_toplevel :: proc(new_tl: ^XdgToplevel) {
     context = ctx
     old := g_server.focused
     g_server.focused = new_tl
+    // ACTIVATED-State beider Fenster hat sich geändert → configure nachschieben
+    // (Größe bleibt gleich; toplevel_send_configure erkennt die State-Änderung).
+    if old != nil && old != new_tl do toplevel_send_configure(old)
+    toplevel_send_configure(new_tl)
     if nested.kb_focused {
         // altem Fenster leave, neuem enter schicken
         if old != nil && old != new_tl {
@@ -252,8 +325,11 @@ input_focus_toplevel :: proc(new_tl: ^XdgToplevel) {
         if kb != nil && surf != nil {
             empty: wls.wl_array = {}
             wls.resource_post_event(kb, wls.WL_KEYBOARD_ENTER, wls.display_next_serial(g_server.display), surf, &empty)
+            send_modifiers_to(kb)
         }
     }
+    // Clipboard: dem neuen Fokus-Client die aktuelle Selection anbieten.
+    data_device_offer_selection_to_focus()
     fmt.printfln("[input] Fokus → %q", new_tl.title)
 }
 
@@ -276,14 +352,22 @@ surface_res_for :: proc(tl: ^XdgToplevel) -> ^wls.wl_resource {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // rift-Client hat wl_seat.get_pointer geschickt.
-input_seat_get_pointer :: proc(client: ^wls.wl_client, id: u32) -> ^wls.wl_resource {
+input_seat_get_pointer :: proc(client: ^wls.wl_client, id: u32, version: c.int) -> ^wls.wl_resource {
     context = ctx
-    ptr := wls.resource_create(client, &wls.pointer_interface, 4, id)
+    ptr := wls.resource_create(client, &wls.pointer_interface, version, id)
     if ptr == nil { wls.client_post_no_memory(client); return nil }
     wls.resource_set_implementation(ptr, &pointer_impl, ptr, pointer_resource_destroy)
     append(&g_server.pointers, ptr)
     fmt.println("[input] rift-Client hat wl_pointer gebunden")
     return ptr
+}
+
+// wl_pointer.frame existiert erst ab v5 — an ältere Clients nie senden
+// (libwayland-client crasht bei Events ohne Listener-Slot).
+pointer_send_frame :: proc(p: ^wls.wl_resource) {
+    if p != nil && wls.resource_get_version(p) >= 5 {
+        wls.resource_post_event(p, wls.WL_POINTER_FRAME)
+    }
 }
 
 pointer_resource_destroy :: proc "c" (resource: ^wls.wl_resource) {
@@ -303,82 +387,112 @@ pointer_resource_for :: proc(tl: ^XdgToplevel) -> ^wls.wl_resource {
     return nil
 }
 
-// Toplevel unter (x,y) finden + surface-lokale Koordinaten (skaliert auf Buffer).
+// wl_pointer-Resource für eine beliebige Surface (Toplevel ODER Popup).
+pointer_resource_for_surface :: proc(surf: ^Surface) -> ^wls.wl_resource {
+    if surf == nil || surf.resource == nil do return nil
+    c_ := wls.resource_get_client(surf.resource)
+    for p in g_server.pointers {
+        if wls.resource_get_client(p) == c_ do return p
+    }
+    return nil
+}
+
+// Surface unter (x,y): Layer top/overlay zuerst (liegen visuell über allem,
+// z.B. rofi), dann Popups (oberste zuerst), dann Floating, dann Tiled,
+// zuletzt Layer bottom/background.
+// tl = zugehöriges Toplevel (bei Popups: Wurzel der Parent-Kette) für Fokus/WM;
+// bei Layer-Surfaces nil (kein Fenster-Fokuswechsel durch Layer-Klicks).
+target_at :: proc(x, y: f64, out_sx, out_sy: ^f64) -> (surf: ^Surface, tl: ^XdgToplevel) {
+    if ls := layer_surface_at(x, y, 2, 3, out_sx, out_sy); ls != nil {
+        return ls, nil
+    }
+    #reverse for p in g_server.popups {
+        if !p.mapped do continue
+        xs := p.xdg_surface
+        if xs == nil || xs.surface == nil do continue
+        ax, ay := popup_abs_pos(p)
+        if x >= f64(ax) && x < f64(ax + p.rel[2]) && y >= f64(ay) && y < f64(ay + p.rel[3]) {
+            wgx, wgy := i32(0), i32(0)
+            if xs.has_win_geom { wgx = xs.win_geom[0]; wgy = xs.win_geom[1] }
+            out_sx^ = x - f64(ax) + f64(wgx)
+            out_sy^ = y - f64(ay) + f64(wgy)
+            return xs.surface, popup_root_toplevel(p)
+        }
+    }
+    t := toplevel_at(x, y, out_sx, out_sy)
+    if t != nil && t.xdg_surface != nil do return t.xdg_surface.surface, t
+    if ls := layer_surface_at(x, y, 0, 1, out_sx, out_sy); ls != nil {
+        return ls, nil
+    }
+    return nil, nil
+}
+
+// Toplevel unter (x,y) finden + surface-lokale Koordinaten.
+// Rendering ist 1:1 (kein Skalieren mehr): surface-lokal = Canvas-Koordinate
+// minus Tile-Origin plus Window-Geometry-Offset (CSD-Schatten).
 // Floating-Fenster werden zuerst geprüft (sie liegen oben auf).
 toplevel_at :: proc(x, y: f64, out_sx, out_sy: ^f64) -> ^XdgToplevel {
-    // Floating-Fenster zuerst (oben auf dem Stack)
+    // Floating/Fullscreen-Fenster zuerst (oben auf dem Stack)
     for tl in g_server.active_ws.toplevels {
-        if !tl.floating do continue
-        g := tl.float_geom
+        if !(tl.floating || tl.fullscreen) do continue
+        g := toplevel_render_geom(tl)
         if x >= f64(g[0]) && x < f64(g[0]+g[2]) && y >= f64(g[1]) && y < f64(g[1]+g[3]) {
-            bw, bh := f64(g[2]), f64(g[3])
-            surf := tl.xdg_surface.surface
-            if surf != nil && surf.current_buffer != nil {
-                shm := wls.shm_buffer_get(surf.current_buffer)
-                if shm != nil {
-                    bw = f64(wls.shm_buffer_get_width(shm))
-                    bh = f64(wls.shm_buffer_get_height(shm))
-                }
-            }
-            out_sx^ = (x - f64(g[0])) / f64(g[2]) * bw
-            out_sy^ = (y - f64(g[1])) / f64(g[3]) * bh
+            xs := tl.xdg_surface
+            wgx, wgy := i32(0), i32(0)
+            if xs != nil && xs.has_win_geom { wgx = xs.win_geom[0]; wgy = xs.win_geom[1] }
+            out_sx^ = x - f64(g[0]) + f64(wgx)
+            out_sy^ = y - f64(g[1]) + f64(wgy)
             return tl
         }
     }
     // Geteilte Fenster
     for tl in g_server.active_ws.toplevels {
-        if tl.floating do continue
+        if tl.floating || tl.fullscreen do continue
         g := tl.geom
         if x >= f64(g[0]) && x < f64(g[0]+g[2]) && y >= f64(g[1]) && y < f64(g[1]+g[3]) {
-            bw, bh := f64(g[2]), f64(g[3])
-            surf := tl.xdg_surface.surface
-            if surf != nil && surf.current_buffer != nil {
-                shm := wls.shm_buffer_get(surf.current_buffer)
-                if shm != nil {
-                    bw = f64(wls.shm_buffer_get_width(shm))
-                    bh = f64(wls.shm_buffer_get_height(shm))
-                }
-            }
-            out_sx^ = (x - f64(g[0])) / f64(g[2]) * bw
-            out_sy^ = (y - f64(g[1])) / f64(g[3]) * bh
+            xs := tl.xdg_surface
+            wgx, wgy := i32(0), i32(0)
+            if xs != nil && xs.has_win_geom { wgx = xs.win_geom[0]; wgy = xs.win_geom[1] }
+            out_sx^ = x - f64(g[0]) + f64(wgx)
+            out_sy^ = y - f64(g[1]) + f64(wgy)
             return tl
         }
     }
     return nil
 }
 
-// Pointer-Fokus auf neues Toplevel setzen (leave altes, enter neues).
-pointer_focus_set :: proc(serial: u32, new_tl: ^XdgToplevel, sx, sy: f64) {
+// Pointer-Fokus auf neue Surface setzen (leave alte, enter neue).
+pointer_focus_set :: proc(serial: u32, new_surf: ^Surface, sx, sy: f64) {
     context = ctx
-    if g_server.ptr_focus == new_tl do return
-    // altem Toplevel leave schicken
+    if g_server.ptr_focus == new_surf do return
+    // alter Surface leave schicken
     if g_server.ptr_focus != nil {
-        old_ptr := pointer_resource_for(g_server.ptr_focus)
-        old_surf := surface_res_for(g_server.ptr_focus)
-        if old_ptr != nil && old_surf != nil {
-            wls.resource_post_event(old_ptr, wls.WL_POINTER_LEAVE, serial, old_surf)
-            wls.resource_post_event(old_ptr, wls.WL_POINTER_FRAME)
+        old := g_server.ptr_focus
+        old_ptr := pointer_resource_for_surface(old)
+        if old_ptr != nil && old.resource != nil {
+            wls.resource_post_event(old_ptr, wls.WL_POINTER_LEAVE, serial, old.resource)
+            pointer_send_frame(old_ptr)
         }
     }
-    g_server.ptr_focus = new_tl
-    if new_tl != nil {
-        p := pointer_resource_for(new_tl)
-        surf := surface_res_for(new_tl)
-        fmt.printfln("[input] pointer_focus_set → ptr_res=%v surf=%v", p != nil, surf != nil)
-        if p != nil && surf != nil {
-            wls.resource_post_event(p, wls.WL_POINTER_ENTER, serial, surf,
+    g_server.ptr_focus = new_surf
+    if new_surf != nil {
+        p := pointer_resource_for_surface(new_surf)
+        if p != nil && new_surf.resource != nil {
+            wls.resource_post_event(p, wls.WL_POINTER_ENTER, serial, new_surf.resource,
                 wls.fixed_from_double(sx), wls.fixed_from_double(sy))
-            wls.resource_post_event(p, wls.WL_POINTER_FRAME)
+            pointer_send_frame(p)
         }
     }
 }
 
-input_pointer_enter :: proc(gained: bool, serial: u32) {
+input_pointer_enter :: proc(gained: bool, host_serial: u32) {
     context = ctx
+    // Eigene Serial statt Host-Serial (einheitlicher Nummernraum für Clients).
+    serial := wls.display_next_serial(g_server.display)
     if gained {
         sx, sy := 0.0, 0.0
-        tl := toplevel_at(nested.ptr_x, nested.ptr_y, &sx, &sy)
-        pointer_focus_set(serial, tl, sx, sy)
+        surf, _ := target_at(nested.ptr_x, nested.ptr_y, &sx, &sy)
+        pointer_focus_set(serial, surf, sx, sy)
     } else {
         pointer_focus_set(serial, nil, 0, 0)
     }
@@ -407,6 +521,7 @@ input_pointer_motion :: proc(time: u32, x, y: f64) {
             dy := i32(y - g_server.wm_start_y)
             tl.float_geom[2] = max(50, g_server.wm_start_gw + dx)
             tl.float_geom[3] = max(50, g_server.wm_start_gh + dy)
+            toplevel_send_configure(tl)
             composite_all()
         } else if g_server.wm_split != nil {
             // Geteilte Resize: Split-Ratio ziehen
@@ -422,15 +537,15 @@ input_pointer_motion :: proc(time: u32, x, y: f64) {
         return
     }
     sx, sy := 0.0, 0.0
-    tl := toplevel_at(x, y, &sx, &sy)
-    if tl != g_server.ptr_focus {
-        pointer_focus_set(wls.display_next_serial(g_server.display), tl, sx, sy)
-    } else if tl != nil {
-        p := pointer_resource_for(tl)
+    surf, _ := target_at(x, y, &sx, &sy)
+    if surf != g_server.ptr_focus {
+        pointer_focus_set(wls.display_next_serial(g_server.display), surf, sx, sy)
+    } else if surf != nil {
+        p := pointer_resource_for_surface(surf)
         if p != nil {
             wls.resource_post_event(p, wls.WL_POINTER_MOTION, time,
                 wls.fixed_from_double(sx), wls.fixed_from_double(sy))
-            wls.resource_post_event(p, wls.WL_POINTER_FRAME)
+            pointer_send_frame(p)
         }
     }
 }
@@ -525,34 +640,42 @@ input_pointer_button :: proc(serial, time, button, state: u32) {
             return
         }
     }
-    // ── Normaler Klick (kein WM-Modifier): Fokus + weiterleiten ──
-    tl := g_server.ptr_focus
-    if tl == nil do return
-    if state == 1 && tl != g_server.focused {
-        input_focus_toplevel(tl)
+    // ── Normaler Klick (kein WM-Modifier): Dismissal + Fokus + weiterleiten ──
+    surf := g_server.ptr_focus
+    // Außenklick: offene grabbed Popups schließen, wenn der Klick NICHT auf
+    // einem Popup landet (Klick daneben oder ins Leere).
+    if state == 1 {
+        on_popup := surf != nil && surf.xdg != nil && surf.xdg.popup != nil
+        if !on_popup && popup_dismiss_grabbed() {
+            composite_all()
+        }
     }
-    p := pointer_resource_for(tl)
+    if surf == nil do return
+    if state == 1 && surf.xdg != nil && surf.xdg.toplevel != nil && surf.xdg.toplevel != g_server.focused {
+        input_focus_toplevel(surf.xdg.toplevel)
+    }
+    p := pointer_resource_for_surface(surf)
     if p != nil {
         wls.resource_post_event(p, wls.WL_POINTER_BUTTON, serial, time, button, state)
-        wls.resource_post_event(p, wls.WL_POINTER_FRAME)
-        if state == 1 do fmt.printfln("[input] click btn %d → %q (mods=0x%x)", button, tl.title, g_server.mods_depressed)
+        pointer_send_frame(p)
+        if state == 1 do fmt.printfln("[input] click btn %d (mods=0x%x)", button, g_server.mods_depressed)
     }
 }
 
 input_pointer_axis :: proc(time, axis: u32, value: f64) {
-    tl := g_server.ptr_focus
-    if tl == nil do return
-    p := pointer_resource_for(tl)
+    surf := g_server.ptr_focus
+    if surf == nil do return
+    p := pointer_resource_for_surface(surf)
     if p == nil do return
     wls.resource_post_event(p, wls.WL_POINTER_AXIS, time, axis, wls.fixed_from_double(value))
-    wls.resource_post_event(p, wls.WL_POINTER_FRAME)
+    pointer_send_frame(p)
 }
 
 input_pointer_frame :: proc() {
-    tl := g_server.ptr_focus
-    if tl == nil do return
-    p := pointer_resource_for(tl)
-    if p != nil do wls.resource_post_event(p, wls.WL_POINTER_FRAME)
+    surf := g_server.ptr_focus
+    if surf == nil do return
+    p := pointer_resource_for_surface(surf)
+    if p != nil do pointer_send_frame(p)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -571,8 +694,7 @@ toggle_floating :: proc(tl: ^XdgToplevel) {
         if w <= 0 do w = 800
         if h <= 0 do h = 600
         // Zentrieren auf Canvas (oder aktuelle Position falls sinnvoll)
-        cw := int(nested.win_w); if cw <= 0 do cw = NESTED_W
-        ch := int(nested.win_h); if ch <= 0 do ch = NESTED_H
+        cw, ch := canvas_size()   // DRM- und Nested-korrekt
         x := tl.geom[0]; y := tl.geom[1]
         if x < 0 || x + w > i32(cw) do x = i32(cw - int(w)) / 2
         if y < 0 || y + h > i32(ch) do y = i32(ch - int(h)) / 2
